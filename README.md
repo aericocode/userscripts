@@ -29,3 +29,7 @@ By default, enabled scripts will update every day.
 
 If this is disabled, or you want to check more often, head to the dashboard and click the refresh button in the top left, or the one each script to only check one at a time.
 If an update is found, the script will automatically update.
+
+---
+
+Made with 🌿 by [aericode](https://ko-fi.com/aericode)
