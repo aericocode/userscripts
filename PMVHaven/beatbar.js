@@ -26,12 +26,14 @@
   const MAX_FETCH_BYTES = 250 * 1024 * 1024;
   const PLAYHEAD_X_FRAC = 0.2;
   const OVERLAY_HEIGHT = 90;
+  const PLAYBACK_BAR_OFFSET = 70; // raise above native playback controls
   const HLS_SEG_CONCURRENCY = 4;
   const PREFERRED_HLS_QUALITY = '240p'; // we want the smallest variant — audio is identical
   const FALLBACK_QUALITY_ORDER = ['240p', '360p', '480p', '720p', '1080p']; // try smallest first
   // Minimum on-screen pixel area for a video to be considered the "main" player.
   // 556 * 312 — sidebar thumbnails and hover-previews stay below this so only the main video gets beats.
   const MIN_VIDEO_AREA = 556 * 312;
+
 
   const PRESETS = {
     kick: { bandLow: 40, bandHigh: 120, minBpm: 80, maxBpm: 180, sensitivity: 1.5, avgWindow: 1.0, q: 1.5 },
@@ -709,9 +711,10 @@
       }
       overlay.style.display = config.showOverlay ? '' : 'none';
       overlay.style.left = `${rect.left}px`;
-      overlay.style.top = `${rect.bottom - OVERLAY_HEIGHT}px`;
+      overlay.style.top = `${rect.bottom - OVERLAY_HEIGHT - PLAYBACK_BAR_OFFSET}px`;
       overlay.style.width = `${rect.width}px`;
       overlay.style.height = `${OVERLAY_HEIGHT}px`;
+      overlay.style.paddingBottom = `2rem`;
       resizeCanvas(state);
     };
     updatePos();
@@ -896,15 +899,29 @@
     const h = canvas.clientHeight;
     if (w === 0 || h === 0) return;
 
-    ctx.clearRect(0, 0, w, h);
-    const grad = ctx.createLinearGradient(0, 0, 0, h);
-    grad.addColorStop(0, 'rgba(0,0,0,0)');
-    grad.addColorStop(1, 'rgba(0,0,0,0.65)');
-    ctx.fillStyle = grad; ctx.fillRect(0, 0, w, h);
+      ctx.clearRect(0, 0, w, h);
 
-    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
+      // Faint rounded card — additive overlay, not native chrome
+      const pad = 4;
+      const radius = 8;
+      const cardX = pad, cardY = pad;
+      const cardW = w - pad * 2, cardH = h - pad * 2;
+
+      ctx.fillStyle = 'rgba(0,0,0,0.28)';
+      ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(cardX, cardY, cardW, cardH, radius);
+      ctx.fill();
+      ctx.stroke();
+
+      // Faint centerline
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(cardX + 8, h / 2);
+      ctx.lineTo(cardX + cardW - 8, h / 2);
+      ctx.stroke();
 
     if (!state.beats.length) return;
 
