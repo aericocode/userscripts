@@ -22,6 +22,10 @@ The easiest way to add these scripts is with the 'raw' URL which allows for easy
 
 Now when you navigate to the page from '// @match' near the top of the script, the script will execute.
 
+## Scripts
+|  Script 	|  Description 	|  Link 	|
+|---	|---	|---	|
+| PMV Haven Beat Bar	| Adds a basic beat bar for Cock Hero type videos  	|  [Link](./PMVHaven/beatbar.js) 	|
 
 
 ## Refreshing Scripts/Pull Updates
