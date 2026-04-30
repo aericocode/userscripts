@@ -43,7 +43,6 @@
 
   const DEFAULT_CONFIG = {
     enabled: false,
-    autoOnSites: [],
     preset: 'kick',
     lookahead: 3,
     showOverlay: true,
@@ -70,7 +69,7 @@
 
   // ── State ───────────────────────────────────────────────
   const videoStates = new WeakMap();
-  let pageEnabled = config.enabled || config.autoOnSites.includes(location.hostname);
+  let pageEnabled = true;
 
   // m3u8 URLs sniffed from the page, kept in arrival order. We use these
   // as our pool of candidate audio sources for blob: videos.
@@ -1015,6 +1014,7 @@
 
   function scanForVideos() {
     if (!pageEnabled) return;
+      log('[BeatBar Script] Loaded');
 
     if (!config.onlyLargest) {
       // Legacy behavior: attach to every analyzable video
@@ -1094,10 +1094,6 @@
         </div>
         <div class="beatbar-modal-body">
           <label class="beatbar-row">
-            <span>Enabled on this site</span>
-            <input type="checkbox" data-key="enabled-site" ${cfg.autoOnSites.includes(location.hostname) ? 'checked' : ''}>
-          </label>
-          <label class="beatbar-row">
             <span>Detection preset</span>
             <select data-key="preset">
               <option value="kick" ${cfg.preset==='kick'?'selected':''}>Kick (steady pulse)</option>
@@ -1173,12 +1169,8 @@
         next.onlyLargest = modal.querySelector('[data-key="onlyLargest"]').checked;
         next.minVideoArea = parseInt(modal.querySelector('[data-key="minVideoArea"]').value, 10) || MIN_VIDEO_AREA;
         const enableHere = modal.querySelector('[data-key="enabled-site"]').checked;
-        const set = new Set(next.autoOnSites);
-        if (enableHere) set.add(location.hostname); else set.delete(location.hostname);
-        next.autoOnSites = [...set];
         saveConfig(next);
         config = next;
-        pageEnabled = config.enabled || config.autoOnSites.includes(location.hostname);
         modal.remove();
         if (pageEnabled) scanForVideos();
         else detachAll();
@@ -1311,8 +1303,7 @@
       if (location.href !== lastUrl) {
         lastUrl = location.href;
         config = getConfig();
-        pageEnabled = config.enabled || config.autoOnSites.includes(location.hostname);
-        if (pageEnabled) debouncedScan();
+        debouncedScan();
       }
     }, 500);
 
