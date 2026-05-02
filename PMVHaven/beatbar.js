@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beat Bar
 // @namespace    https://github.com/Aericocode/userscripts
-// @version      2.2.0
+// @version      2.4.0
 // @description  Detect & visualize beats on direct-MP4 OR HLS-streaming videos. Sniffs m3u8 playlists, fetches lowest-quality variant, transmuxes TS→fMP4 audio, runs offline beat detection, overlays scrolling beat bar synced to playback.
 // @author       Aericocode
 // @match        https://pmvhaven.com/*
@@ -24,16 +24,14 @@
   const DB_STORE = 'beats';
   const DB_VERSION = 1;
   const MAX_FETCH_BYTES = 250 * 1024 * 1024;
-  const PLAYHEAD_X_FRAC = 0.2;
-  const OVERLAY_HEIGHT = 90;
+  const PLAYHEAD_X_FRAC = 0.5;
   const PLAYBACK_BAR_OFFSET = 70; // raise above native playback controls
   const HLS_SEG_CONCURRENCY = 4;
-  const PREFERRED_HLS_QUALITY = '240p'; // we want the smallest variant — audio is identical
-  const FALLBACK_QUALITY_ORDER = ['240p', '360p', '480p', '720p', '1080p']; // try smallest first
-  // Minimum on-screen pixel area for a video to be considered the "main" player.
-  // 556 * 312 — sidebar thumbnails and hover-previews stay below this so only the main video gets beats.
+  const PREFERRED_HLS_QUALITY = '240p';
+  const FALLBACK_QUALITY_ORDER = ['240p', '360p', '480p', '720p', '1080p'];
   const MIN_VIDEO_AREA = 556 * 312;
 
+  const SIZE_HEIGHTS = { small: 60, medium: 90, large: 130 };
 
   const PRESETS = {
     kick: { bandLow: 40, bandHigh: 120, minBpm: 80, maxBpm: 180, sensitivity: 1.5, avgWindow: 1.0, q: 1.5 },
@@ -42,16 +40,19 @@
   };
 
   const DEFAULT_CONFIG = {
-    enabled: false,
+    enabled: true,            // page-level on/off, persists across reloads
     preset: 'kick',
-    lookahead: 3,
+    lookahead: 5,
     showOverlay: true,
     tickEnabled: false,
     autoMaxSizeMB: 100,
     hlsQuality: PREFERRED_HLS_QUALITY,
-    onlyLargest: true,        // attach only to the largest visible video on the page
-    minVideoArea: MIN_VIDEO_AREA, // px² floor for any video to qualify
-    tickLeadMs: 30,           // fire visuals/tick this many ms BEFORE the beat timestamp
+    onlyLargest: true,
+    minVideoArea: MIN_VIDEO_AREA,
+    tickLeadMs: 30,           // VISUAL lead — fires pulse/tick N ms before beat (latency comp)
+    beatOffsetMs: 0,          // TIMING shift — moves the actual beat marker by N ms (negative = earlier)
+    sensitivity: 1.0,         // multiplier on preset sensitivity, 0.5–3.0
+    size: 'medium',
   };
 
   // ── Utilities ───────────────────────────────────────────
@@ -67,35 +68,37 @@
   function saveConfig(cfg) { GM_setValue('config', JSON.stringify(cfg)); }
   let config = getConfig();
 
+  // Cache key params — anything that affects detection output goes here.
+  // Stored on the cache entry; we recompute when this string differs.
+  function cacheParams() {
+    return `${config.preset}@s${(config.sensitivity || 1).toFixed(2)}`;
+  }
+
+  function currentOverlayHeight() {
+    return SIZE_HEIGHTS[config.size] || SIZE_HEIGHTS.medium;
+  }
+
   // ── State ───────────────────────────────────────────────
   const videoStates = new WeakMap();
-  let pageEnabled = true;
+  let pageEnabled = config.enabled !== false;
 
-  // m3u8 URLs sniffed from the page, kept in arrival order. We use these
-  // as our pool of candidate audio sources for blob: videos.
-  const sniffedM3u8s = []; // [{ url, ts, host, used }]
+  const sniffedM3u8s = [];
   const M3U8_BUFFER_MAX = 50;
 
   // ═══════════════════════════════════════════════════════
   //   NETWORK SNIFFER (document-start)
-  //   Watches for *.m3u8 fetches so we know what's playing on
-  //   pages that use HLS (blob: src on the <video>).
   // ═══════════════════════════════════════════════════════
   (function installSniffer() {
     function recordIfM3u8(url) {
       if (!url || typeof url !== 'string') return;
-      // Match .m3u8 with optional query string
       if (!/\.m3u8(\?|$)/i.test(url)) return;
-      // Resolve to absolute
       let abs;
       try { abs = new URL(url, location.href).href; } catch { return; }
-      // Skip duplicates already in the buffer
       if (sniffedM3u8s.some(e => e.url === abs)) return;
       const entry = { url: abs, ts: Date.now(), host: location.hostname, used: false };
       sniffedM3u8s.push(entry);
       if (sniffedM3u8s.length > M3U8_BUFFER_MAX) sniffedM3u8s.shift();
       log('m3u8 sniffed:', abs);
-      // Notify any waiting blob videos
       onM3u8Sniffed(entry);
     }
 
@@ -116,8 +119,6 @@
     log('Network sniffer installed at', document.readyState);
   })();
 
-  // Called whenever a new m3u8 is captured — checks if any pending blob videos
-  // can now be analyzed.
   function onM3u8Sniffed(entry) {
     if (!pageEnabled) return;
     document.querySelectorAll('video').forEach(v => {
@@ -191,17 +192,12 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  //   HLS pipeline: m3u8 → segments → transmux → audio buffer
+  //   HLS pipeline
   // ═══════════════════════════════════════════════════════
-
-  // Try to swap the variant in a URL like:
-  //   .../video.mp4/720p.m3u8        -> 360p.m3u8
-  //   .../master.m3u8 (multi-variant) -> picks smallest after parsing
   function buildLowQualityVariantUrl(originalUrl, preferredQuality) {
     const filenameMatch = originalUrl.match(/\/([^\/?]+\.m3u8)(\?|$)/i);
     if (!filenameMatch) return null;
     const filename = filenameMatch[1];
-    // Pattern: 720p.m3u8 / 480p.m3u8 / etc
     const qualityMatch = filename.match(/^(\d+p)\.m3u8$/i);
     if (qualityMatch) {
       const swapped = filename.replace(/^\d+p\.m3u8$/i, `${preferredQuality}.m3u8`);
@@ -210,7 +206,6 @@
     return null;
   }
 
-  // Fetch & parse m3u8, return { kind: 'master'|'media', segments?, variants? }
   async function fetchAndParseM3u8(url) {
     const text = await gmFetch(url, { responseType: 'text' });
     return parseM3u8(text, url);
@@ -224,7 +219,6 @@
       for (let i = 0; i < lines.length; i++) {
         if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
           const info = parseAttrList(lines[i]);
-          // Next non-comment line is the variant URL
           let j = i + 1;
           while (j < lines.length && lines[j].startsWith('#')) j++;
           if (j < lines.length) {
@@ -256,12 +250,10 @@
   }
 
   function parseAttrList(line) {
-    // Parse #EXT-X-STREAM-INF:BANDWIDTH=1234,RESOLUTION=640x360,...
     const colonIdx = line.indexOf(':');
     if (colonIdx === -1) return {};
     const attrStr = line.slice(colonIdx + 1);
     const out = {};
-    // Simple parser handling quoted values
     const re = /([A-Z0-9-]+)=("([^"]*)"|([^,]*))/g;
     let m;
     while ((m = re.exec(attrStr)) !== null) {
@@ -270,10 +262,7 @@
     return out;
   }
 
-  // Resolve any m3u8 URL down to a media playlist with segments,
-  // preferring lowest quality (smallest bandwidth or smallest resolution height).
   async function resolveToMediaPlaylist(m3u8Url) {
-    // First, try the URL-substitution shortcut to get a small variant fast
     const shortcut = buildLowQualityVariantUrl(m3u8Url, config.hlsQuality);
     if (shortcut && shortcut !== m3u8Url) {
       try {
@@ -287,12 +276,10 @@
       }
     }
 
-    // Parse the original
     const parsed = await fetchAndParseM3u8(m3u8Url);
     if (parsed.kind === 'media') {
       return { mediaUrl: m3u8Url, segments: parsed.segments };
     }
-    // Master playlist: pick lowest bandwidth variant
     if (!parsed.variants.length) throw new Error('Master playlist has no variants');
     const lowest = parsed.variants
       .slice()
@@ -303,12 +290,10 @@
     return { mediaUrl: lowest.url, segments: sub.segments };
   }
 
-  // Fetch all .ts segments concurrently (limited)
   async function fetchAllSegments(segments, onProgress) {
     const results = new Array(segments.length);
     let nextIdx = 0;
     let completed = 0;
-    let totalBytes = 0;
     let bytesLoaded = 0;
 
     async function worker() {
@@ -331,31 +316,24 @@
     return results;
   }
 
-  // Push all TS segments through the mux.js transmuxer to get
-  // fragmented MP4 bytes (init segment + audio mdat boxes), then concat.
   async function transmuxTsToFmp4Audio(tsSegments) {
     if (!window.muxjs) throw new Error('mux.js not available');
     return new Promise((resolve, reject) => {
       const transmuxer = new window.muxjs.mp4.Transmuxer({ remux: false });
-      const collected = []; // array of Uint8Arrays from 'data' events
+      const collected = [];
       let initSeg = null;
 
       transmuxer.on('data', (segment) => {
-        // segment.type is 'audio', 'video', or 'combined' depending on options
-        // With remux:false we get separate audio + video segments. Keep audio only.
         if (segment.type === 'video') return;
-        if (!initSeg && segment.initSegment) {
-          initSeg = segment.initSegment;
-        }
+        if (!initSeg && segment.initSegment) initSeg = segment.initSegment;
         if (segment.data) collected.push(segment.data);
       });
 
       transmuxer.on('done', () => {
         if (!initSeg || !collected.length) {
-          reject(new Error('Transmuxer produced no audio data — TS may be video-only or unsupported codec'));
+          reject(new Error('Transmuxer produced no audio data'));
           return;
         }
-        // Concatenate: initSegment + all data segments
         let totalLen = initSeg.byteLength;
         for (const d of collected) totalLen += d.byteLength;
         const out = new Uint8Array(totalLen);
@@ -369,18 +347,14 @@
       });
 
       try {
-        for (const ts of tsSegments) {
-          transmuxer.push(ts);
-        }
+        for (const ts of tsSegments) transmuxer.push(ts);
         transmuxer.flush();
-      } catch (e) {
-        reject(e);
-      }
+      } catch (e) { reject(e); }
     });
   }
 
   // ═══════════════════════════════════════════════════════
-  //   Beat detection (unchanged)
+  //   Beat detection
   // ═══════════════════════════════════════════════════════
   function detectBeats(audioBuffer, opts) {
     const { sensitivity, minGapMs, avgWindowSec } = opts;
@@ -444,6 +418,7 @@
 
   async function analyzeAudioBuffer(arrayBuffer, presetKey) {
     const p = PRESETS[presetKey] || PRESETS.kick;
+    const sensMult = config.sensitivity || 1.0;
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     let decoded;
     try {
@@ -464,8 +439,12 @@
     const filtered = await offline.startRendering();
 
     const minGapMs = (60 / p.maxBpm) * 1000;
+    // Lower sensitivity-multiplier value = MORE beats (lower threshold). We want
+    // the user-facing slider to feel intuitive: higher = more sensitive = more beats.
+    // So divide the preset's sensitivity by the user multiplier.
+    const effectiveSensitivity = p.sensitivity / sensMult;
     const beats = detectBeats(filtered, {
-      sensitivity: p.sensitivity,
+      sensitivity: effectiveSensitivity,
       minGapMs,
       avgWindowSec: p.avgWindow,
     });
@@ -498,8 +477,8 @@
     const state = {
       video,
       kind: videoSrcKind(video),
-      sourceUrl: null,        // canonical cache key (mp4 URL or m3u8 URL)
-      m3u8Url: null,          // for blob/HLS videos
+      sourceUrl: null,
+      m3u8Url: null,
       beats: [],
       bpm: 0,
       lastBeatIdx: -1,
@@ -525,10 +504,9 @@
     startRenderLoop(state);
 
     if (state.kind === 'http') {
-      // Direct MP4 path (v1 behavior)
       state.sourceUrl = getDirectVideoSrc(video);
       const cached = await cacheGet(state.sourceUrl);
-      if (cached && cached.params === config.preset) {
+      if (cached && cached.params === cacheParams()) {
         state.beats = cached.beats; state.bpm = cached.bpm;
         setStatus(state, `${cached.beats.length} beats · ${cached.bpm.toFixed(1)} BPM (cached)`, 'ok');
         scheduleStatusClear(state);
@@ -539,7 +517,6 @@
     }
 
     if (state.kind === 'blob') {
-      // HLS path: try to match an already-sniffed m3u8, otherwise wait.
       const candidate = pickM3u8ForVideo(video);
       if (candidate) {
         attachM3u8ToVideo(state, candidate);
@@ -550,15 +527,10 @@
     }
   }
 
-  // Heuristic: pick the most recent unused m3u8 that matches the page's host group.
-  // For multi-video pages we'd need smarter matching, but for typical "one video
-  // playing" pages the most recent m3u8 wins.
   function pickM3u8ForVideo(video) {
-    // Prefer the most recent unused one
     for (let i = sniffedM3u8s.length - 1; i >= 0; i--) {
       if (!sniffedM3u8s[i].used) return sniffedM3u8s[i];
     }
-    // If all used, return the most recent
     return sniffedM3u8s[sniffedM3u8s.length - 1] || null;
   }
 
@@ -566,11 +538,11 @@
     if (state.destroyed) return;
     state.waitingForM3u8 = false;
     state.m3u8Url = m3u8Entry.url;
-    state.sourceUrl = m3u8Entry.url; // cache key is the playlist URL
+    state.sourceUrl = m3u8Entry.url;
     m3u8Entry.used = true;
 
     const cached = await cacheGet(state.sourceUrl);
-    if (cached && cached.params === config.preset) {
+    if (cached && cached.params === cacheParams()) {
       state.beats = cached.beats; state.bpm = cached.bpm;
       setStatus(state, `${cached.beats.length} beats · ${cached.bpm.toFixed(1)} BPM (cached)`, 'ok');
       scheduleStatusClear(state);
@@ -650,9 +622,42 @@
     state.bpm = bpm;
     state.lastBeatIdx = -1;
     state.pulses.clear();
-    cacheSet(state.sourceUrl, beats, bpm, config.preset);
+    cacheSet(state.sourceUrl, beats, bpm, cacheParams());
     setStatus(state, `${beats.length} beats · ${bpm.toFixed(1)} BPM`, 'ok');
     scheduleStatusClear(state);
+  }
+
+  // Re-analyze the currently-attached main video with whatever the
+  // current preset is. Used when the user changes detection from the inline UI.
+  function reanalyzeAttached() {
+    document.querySelectorAll('video').forEach(v => {
+      const state = videoStates.get(v);
+      if (!state) return;
+      state.beats = []; state.bpm = 0; state.lastBeatIdx = -1; state.pulses.clear();
+      if (state.kind === 'http' && state.sourceUrl) {
+        cacheGet(state.sourceUrl).then(cached => {
+          if (state.destroyed) return;
+          if (cached && cached.params === cacheParams()) {
+            state.beats = cached.beats; state.bpm = cached.bpm;
+            setStatus(state, `${cached.beats.length} beats · ${cached.bpm.toFixed(1)} BPM (cached)`, 'ok');
+            scheduleStatusClear(state);
+          } else {
+            analyzeMp4Video(state);
+          }
+        });
+      } else if (state.m3u8Url) {
+        cacheGet(state.sourceUrl).then(cached => {
+          if (state.destroyed) return;
+          if (cached && cached.params === cacheParams()) {
+            state.beats = cached.beats; state.bpm = cached.bpm;
+            setStatus(state, `${cached.beats.length} beats · ${cached.bpm.toFixed(1)} BPM (cached)`, 'ok');
+            scheduleStatusClear(state);
+          } else {
+            analyzeHlsVideo(state);
+          }
+        });
+      }
+    });
   }
 
   function detachFromVideo(video) {
@@ -668,7 +673,7 @@
   }
 
   // ═══════════════════════════════════════════════════════
-  //   Overlay creation (unchanged from v1)
+  //   Overlay creation
   // ═══════════════════════════════════════════════════════
   function createOverlay(state) {
     const overlay = document.createElement('div');
@@ -708,14 +713,16 @@
         overlay.style.display = 'none';
         return;
       }
+      const h = currentOverlayHeight();
       overlay.style.display = config.showOverlay ? '' : 'none';
       overlay.style.left = `${rect.left}px`;
-      overlay.style.top = `${rect.bottom - OVERLAY_HEIGHT - PLAYBACK_BAR_OFFSET}px`;
+      overlay.style.top = `${rect.bottom - h - PLAYBACK_BAR_OFFSET}px`;
       overlay.style.width = `${rect.width}px`;
-      overlay.style.height = `${OVERLAY_HEIGHT}px`;
+      overlay.style.height = `${h}px`;
       overlay.style.paddingBottom = `2rem`;
       resizeCanvas(state);
     };
+    state._updatePos = updatePos;
     updatePos();
     state.ro = new ResizeObserver(updatePos);
     try { state.ro.observe(state.video); } catch {}
@@ -732,8 +739,15 @@
       }
       requestAnimationFrame(updatePos);
     });
-    state._updatePos = updatePos;
     state._posInterval = setInterval(updatePos, 1000);
+  }
+
+  // Reposition all attached overlays — call after size/lookahead changes.
+  function repositionAll() {
+    document.querySelectorAll('video').forEach(v => {
+      const s = videoStates.get(v);
+      if (s && s._updatePos) s._updatePos();
+    });
   }
 
   function resizeCanvas(state) {
@@ -754,6 +768,124 @@
     if (!state.statusEl) return;
     state.statusEl.textContent = text;
     state.statusEl.className = 'beatbar-status' + (kind ? ` beatbar-status--${kind}` : '');
+  }
+
+  // ═══════════════════════════════════════════════════════
+  //   Inline controls injected into PMVHaven's video info bar
+  //
+  //   The page's info row uses Tailwind classes:
+  //     .pb-4.border-b.border-[#2A2A2A]  → outer wrapper
+  //       > div.grid                      → row 1: stats (left) + actions (right)
+  //         > div.flex…text-gray-400      → stats (views, date, duration)
+  //   We append a controls strip into that .flex.text-gray-400 row, pushed
+  //   right with margin-left:auto, sitting opposite the duration.
+  //   Vue may re-render this section, so we re-inject on every scan tick.
+  // ═══════════════════════════════════════════════════════
+  function findInfoStatsRow() {
+    // The stats row containing views/date/duration spans
+    const candidates = document.querySelectorAll('.pb-4.border-b div.flex');
+    for (const el of candidates) {
+      // Heuristic: it has children with the lucide icons + small text
+      if (el.querySelector('span') && el.children.length >= 2 &&
+          /views|view/i.test(el.textContent)) {
+        return el;
+      }
+    }
+    return null;
+  }
+
+  function ensureInlineControls() {
+    // Always inject controls — the toggle lives inside them, so users need
+    // access even when Beats are off.
+    const row = findInfoStatsRow();
+    if (!row) return;
+    if (row.querySelector('.beatbar-inline')) return;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'beatbar-inline';
+    wrap.innerHTML = `
+      <button class="beatbar-pill beatbar-pill--toggle" data-bb="toggle" title="Enable / disable Beat Bar on this page">
+        <span class="beatbar-pill-dot"></span>
+        <span class="beatbar-pill-label">Beats</span>
+      </button>
+      <select class="beatbar-pill beatbar-pill--select" data-bb="preset" title="Detection method">
+        <option value="broad">Broad</option>
+        <option value="kick">Kick</option>
+        <option value="snare">Snare</option>
+      </select>
+      <select class="beatbar-pill beatbar-pill--select" data-bb="size" title="Bar size">
+        <option value="small">S</option>
+        <option value="medium">M</option>
+        <option value="large">L</option>
+      </select>
+      <div class="beatbar-pill beatbar-pill--range" title="Lookahead — how many seconds of upcoming beats to show">
+        <span class="beatbar-range-label">Speed</span>
+        <input type="range" data-bb="lookahead" min="2.5" max="7.5" step="0.5">
+        <span class="beatbar-range-val" data-bb="lookahead-val"></span>
+      </div>
+      <div class="beatbar-pill beatbar-pill--range" title="Sensitivity — higher = more beats detected. Re-runs detection.">
+        <span class="beatbar-range-label">Sens</span>
+        <input type="range" data-bb="sensitivity" min="0.5" max="3" step="0.1">
+        <span class="beatbar-range-val" data-bb="sensitivity-val"></span>
+      </div>
+      <button class="beatbar-pill beatbar-pill--icon" data-bb="settings" title="Beat Bar settings">⚙</button>
+    `;
+
+    // Reflect current config
+    wrap.querySelector('[data-bb="preset"]').value = config.preset;
+    wrap.querySelector('[data-bb="size"]').value = config.size;
+    const lookInput = wrap.querySelector('[data-bb="lookahead"]');
+    const lookVal = wrap.querySelector('[data-bb="lookahead-val"]');
+    lookInput.value = config.lookahead;
+    lookVal.textContent = `${config.lookahead}s`;
+    const sensInput = wrap.querySelector('[data-bb="sensitivity"]');
+    const sensVal = wrap.querySelector('[data-bb="sensitivity-val"]');
+    sensInput.value = config.sensitivity;
+    sensVal.textContent = `${config.sensitivity.toFixed(1)}×`;
+    if (pageEnabled) wrap.querySelector('[data-bb="toggle"]').classList.add('on');
+
+    // Wire events
+    wrap.querySelector('[data-bb="toggle"]').addEventListener('click', () => {
+      pageEnabled = !pageEnabled;
+      config.enabled = pageEnabled;
+      saveConfig(config);
+      wrap.querySelector('[data-bb="toggle"]').classList.toggle('on', pageEnabled);
+      if (pageEnabled) scanForVideos();
+      else detachAll();
+    });
+
+    wrap.querySelector('[data-bb="preset"]').addEventListener('change', (e) => {
+      config.preset = e.target.value;
+      saveConfig(config);
+      reanalyzeAttached();
+    });
+
+    wrap.querySelector('[data-bb="size"]').addEventListener('change', (e) => {
+      config.size = e.target.value;
+      saveConfig(config);
+      repositionAll();
+    });
+
+    lookInput.addEventListener('input', (e) => {
+      config.lookahead = parseFloat(e.target.value);
+      lookVal.textContent = `${config.lookahead}s`;
+      saveConfig(config);
+    });
+
+    // Sensitivity: changes during slide are cheap (just save + label),
+    // re-analysis only fires on `change` (release) to avoid thrashing.
+    sensInput.addEventListener('input', (e) => {
+      config.sensitivity = parseFloat(e.target.value);
+      sensVal.textContent = `${config.sensitivity.toFixed(1)}×`;
+      saveConfig(config);
+    });
+    sensInput.addEventListener('change', () => {
+      reanalyzeAttached();
+    });
+
+    wrap.querySelector('[data-bb="settings"]').addEventListener('click', openSettings);
+
+    row.appendChild(wrap);
   }
 
   // ═══════════════════════════════════════════════════════
@@ -778,7 +910,7 @@
           state.beats = []; state.bpm = 0; state.lastBeatIdx = -1; state.pulses.clear();
           cacheGet(newUrl).then(cached => {
             if (state.destroyed) return;
-            if (cached && cached.params === config.preset) {
+            if (cached && cached.params === cacheParams()) {
               state.beats = cached.beats; state.bpm = cached.bpm;
               setStatus(state, `${cached.beats.length} beats · ${cached.bpm.toFixed(1)} BPM (cached)`, 'ok');
               scheduleStatusClear(state);
@@ -830,11 +962,13 @@
   }
 
   function checkBeatsPassed(state) {
-    // Apply a lead time so visuals and audio fire slightly EARLIER than the
-    // raw beat timestamp. Compensates for audio output latency and matches
-    // the musical convention of the click leading the eye into the beat.
+    // beatOffsetMs shifts WHEN a beat is considered to occur (positive = later).
+    // tickLeadMs makes us fire the pulse N ms before that effective time.
+    const offset = (config.beatOffsetMs || 0) / 1000;
     const lead = (config.tickLeadMs || 0) / 1000;
-    const t = state.smoothTime + lead;
+    // We want to fire when (effectiveBeat = beat + offset) reaches (smoothTime + lead).
+    // Equivalently: fire when beat <= smoothTime + lead - offset.
+    const t = state.smoothTime + lead - offset;
 
     if (state.lastBeatIdx >= 0 && state.beats[state.lastBeatIdx] > t + 0.1) {
       let lo = 0, hi = state.beats.length;
@@ -858,7 +992,6 @@
     const ac = state.audioCtx;
     const now = ac.currentTime;
 
-    // Body — sine 155→65 Hz drop in 25ms, very fast attack
     const osc = ac.createOscillator();
     const gain = ac.createGain();
     osc.type = 'sine';
@@ -871,7 +1004,6 @@
     osc.start(now);
     osc.stop(now + 0.048);
 
-    // Click layer — filtered noise burst for the "tk" attack snap
     const bufLen = Math.ceil(0.008 * ac.sampleRate);
     const noise = ac.createBuffer(1, bufLen, ac.sampleRate);
     const data = noise.getChannelData(0);
@@ -898,33 +1030,34 @@
     const h = canvas.clientHeight;
     if (w === 0 || h === 0) return;
 
-      ctx.clearRect(0, 0, w, h);
+    ctx.clearRect(0, 0, w, h);
 
-      // Faint rounded card — additive overlay, not native chrome
-      const pad = 4;
-      const radius = 8;
-      const cardX = pad, cardY = pad;
-      const cardW = w - pad * 2, cardH = h - pad * 2;
+    const pad = 4;
+    const radius = 8;
+    const cardX = pad, cardY = pad;
+    const cardW = w - pad * 2, cardH = h - pad * 2;
 
-      ctx.fillStyle = 'rgba(0,0,0,0.28)';
-      ctx.strokeStyle = 'rgba(255,255,255,0.14)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.roundRect(cardX, cardY, cardW, cardH, radius);
-      ctx.fill();
-      ctx.stroke();
+    ctx.fillStyle = 'rgba(0,0,0,0.28)';
+    ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(cardX, cardY, cardW, cardH, radius);
+    ctx.fill();
+    ctx.stroke();
 
-      // Faint centerline
-      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(cardX + 8, h / 2);
-      ctx.lineTo(cardX + cardW - 8, h / 2);
-      ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(cardX + 8, h / 2);
+    ctx.lineTo(cardX + cardW - 8, h / 2);
+    ctx.stroke();
 
     if (!state.beats.length) return;
 
-    const t = state.smoothTime;
+    // beatOffsetMs shifts where beats sit on the bar. Subtracting from `t`
+    // is equivalent to adding the offset to every beat's effective time.
+    const offset = (config.beatOffsetMs || 0) / 1000;
+    const t = state.smoothTime - offset;
     const lookahead = config.lookahead;
     const playheadX = w * PLAYHEAD_X_FRAC;
     const lookbehind = lookahead * (PLAYHEAD_X_FRAC / (1 - PLAYHEAD_X_FRAC));
@@ -992,14 +1125,11 @@
   function videoOnScreenArea(v) {
     const r = v.getBoundingClientRect();
     if (r.width < 1 || r.height < 1) return 0;
-    // Reject if entirely off-screen
     if (r.bottom < 0 || r.top > window.innerHeight) return 0;
     if (r.right < 0 || r.left > window.innerWidth) return 0;
     return r.width * r.height;
   }
 
-  // Pick the biggest visible <video> on the page that has a usable src.
-  // Returns null if nothing qualifies.
   function pickMainVideo() {
     let best = null;
     let bestArea = 0;
@@ -1013,11 +1143,12 @@
   }
 
   function scanForVideos() {
+    // Inline controls live in the page chrome, attempt to ensure them every scan
+    ensureInlineControls();
+
     if (!pageEnabled) return;
-      log('[BeatBar Script] Loaded');
 
     if (!config.onlyLargest) {
-      // Legacy behavior: attach to every analyzable video
       document.querySelectorAll('video').forEach(v => {
         if (videoStates.has(v)) return;
         if (!isPotentiallyAnalyzable(v)) {
@@ -1035,11 +1166,8 @@
       return;
     }
 
-    // Main-only mode: pick the largest visible analyzable video
     const main = pickMainVideo();
 
-    // If no candidate yet (e.g. metadata not loaded), set up listeners on all
-    // <video> elements so we re-scan when any becomes ready.
     if (!main) {
       for (const v of document.querySelectorAll('video')) {
         if (v.__beatbarMetaListening) continue;
@@ -1052,7 +1180,6 @@
       return;
     }
 
-    // Detach any previously-attached videos that aren't the new main
     for (const v of document.querySelectorAll('video')) {
       if (v !== main && videoStates.has(v)) {
         log('Detaching from non-main video');
@@ -1060,7 +1187,6 @@
       }
     }
 
-    // Attach to main if not already
     if (!videoStates.has(main)) {
       log('Attaching to main video, area=' + Math.round(videoOnScreenArea(main)));
       attachToVideo(main);
@@ -1102,6 +1228,14 @@
             </select>
           </label>
           <label class="beatbar-row">
+            <span>Bar size</span>
+            <select data-key="size">
+              <option value="small" ${cfg.size==='small'?'selected':''}>Small</option>
+              <option value="medium" ${cfg.size==='medium'?'selected':''}>Medium</option>
+              <option value="large" ${cfg.size==='large'?'selected':''}>Large</option>
+            </select>
+          </label>
+          <label class="beatbar-row">
             <span>HLS quality (lowest = fastest)</span>
             <select data-key="hlsQuality">
               <option value="240p" ${cfg.hlsQuality==='240p'?'selected':''}>240p</option>
@@ -1112,14 +1246,22 @@
           </label>
           <label class="beatbar-row">
             <span>Lookahead (sec)</span>
-            <input type="number" data-key="lookahead" min="1" max="8" step="0.5" value="${cfg.lookahead}">
+            <input type="number" data-key="lookahead" min="2.5" max="7.5" step="0.5" value="${cfg.lookahead}">
+          </label>
+          <label class="beatbar-row">
+            <span>Sens (×) <span class="beatbar-faint" title="Detection sensitivity multiplier. Higher = more beats detected. Re-runs detection on save.">ⓘ</span></span>
+            <input type="number" data-key="sensitivity" min="0.5" max="3" step="0.1" value="${cfg.sensitivity}">
+          </label>
+          <label class="beatbar-row">
+            <span>Beat offset (ms) <span class="beatbar-faint" title="Shift detected beats by N ms. Positive = later, negative = earlier. Adjust if beat markers consistently miss the centerline.">ⓘ</span></span>
+            <input type="number" data-key="beatOffsetMs" min="-500" max="500" step="5" value="${cfg.beatOffsetMs}">
           </label>
           <label class="beatbar-row">
             <span>Audio tick on beat</span>
             <input type="checkbox" data-key="tickEnabled" ${cfg.tickEnabled?'checked':''}>
           </label>
           <label class="beatbar-row">
-            <span>Tick lead (ms) <span class="beatbar-faint" title="Fire visuals & tick this many ms before the beat. Compensates for audio output latency. 20-50ms feels right on most systems.">ⓘ</span></span>
+            <span>Tick lead (ms) <span class="beatbar-faint" title="Visual lead — fire pulse & tick this many ms before the beat. Compensates for audio output latency. Independent of beat offset.">ⓘ</span></span>
             <input type="number" data-key="tickLeadMs" min="0" max="200" step="5" value="${cfg.tickLeadMs}">
           </label>
           <label class="beatbar-row">
@@ -1128,7 +1270,7 @@
           </label>
           <hr>
           <label class="beatbar-row">
-            <span>Main video only <span class="beatbar-faint" title="Only attach to the largest visible video on the page (skips sidebar previews & hover thumbnails)">ⓘ</span></span>
+            <span>Main video only</span>
             <input type="checkbox" data-key="onlyLargest" ${cfg.onlyLargest?'checked':''}>
           </label>
           <label class="beatbar-row">
@@ -1137,9 +1279,7 @@
           </label>
           <hr>
           <div class="beatbar-faint" style="font-size:11px;line-height:1.5">
-            Beat Bar is OFF by default. Toggle "Enabled on this site" to remember the host.
-            Press <b>Alt+B</b> to enable for one page. HLS support requires a sniffed m3u8 —
-            once you start playing a video, the script auto-detects the playlist.
+            Press <b>Alt+B</b> to toggle Beat Bar on this page.
           </div>
           <div class="beatbar-faint" style="font-size:11px">
             Sniffed m3u8s on this page: <b>${sniffedM3u8s.length}</b>
@@ -1161,19 +1301,29 @@
       if (btn.dataset.act === 'save') {
         const next = { ...cfg };
         next.preset = modal.querySelector('[data-key="preset"]').value;
+        next.size = modal.querySelector('[data-key="size"]').value;
         next.hlsQuality = modal.querySelector('[data-key="hlsQuality"]').value;
         next.lookahead = parseFloat(modal.querySelector('[data-key="lookahead"]').value);
+        next.sensitivity = parseFloat(modal.querySelector('[data-key="sensitivity"]').value) || 1.0;
+        next.beatOffsetMs = parseFloat(modal.querySelector('[data-key="beatOffsetMs"]').value) || 0;
         next.tickEnabled = modal.querySelector('[data-key="tickEnabled"]').checked;
         next.tickLeadMs = parseFloat(modal.querySelector('[data-key="tickLeadMs"]').value) || 0;
         next.showOverlay = modal.querySelector('[data-key="showOverlay"]').checked;
         next.onlyLargest = modal.querySelector('[data-key="onlyLargest"]').checked;
         next.minVideoArea = parseInt(modal.querySelector('[data-key="minVideoArea"]').value, 10) || MIN_VIDEO_AREA;
-        const enableHere = modal.querySelector('[data-key="enabled-site"]').checked;
+        // Detection-affecting fields — only re-analyze if these changed
+        const detectionChanged = next.preset !== cfg.preset || next.sensitivity !== cfg.sensitivity;
         saveConfig(next);
         config = next;
         modal.remove();
-        if (pageEnabled) scanForVideos();
-        else detachAll();
+        // Sync the inline controls
+        const row = document.querySelector('.beatbar-inline');
+        if (row) row.remove();
+        ensureInlineControls();
+        if (pageEnabled) {
+          repositionAll();
+          if (detectionChanged) reanalyzeAttached();
+        } else detachAll();
       }
       if (btn.dataset.act === 'clear-cache') {
         try {
@@ -1231,6 +1381,70 @@
       .beatbar-btn--primary { background: #5385f1; border-color: #5385f1; }
       .beatbar-btn--primary:hover { background: #4077EF; }
 
+      /* Inline controls — match PMVHaven info-bar pill style */
+      .beatbar-inline {
+        display: inline-flex; align-items: center; gap: 6px;
+        margin-left: auto;
+        font-size: 12px;
+      }
+      .beatbar-pill {
+        display: inline-flex; align-items: center; gap: 6px;
+        background: #2A2A2A; color: #9ca3af;
+        border: none; outline: none;
+        padding: 4px 10px; height: 28px;
+        border-radius: 8px;
+        font-size: 12px; font-family: inherit;
+        cursor: pointer; transition: background .12s, color .12s;
+        line-height: 1;
+      }
+      .beatbar-pill:hover { background: #3A3A3A; color: #fff; }
+      .beatbar-pill--select {
+        appearance: none;
+        padding-right: 22px;
+        background-image:
+          linear-gradient(45deg, transparent 50%, currentColor 50%),
+          linear-gradient(135deg, currentColor 50%, transparent 50%);
+        background-position:
+          calc(100% - 12px) 12px,
+          calc(100% - 8px) 12px;
+        background-size: 4px 4px, 4px 4px;
+        background-repeat: no-repeat;
+      }
+      .beatbar-pill--select option { background: #1f1f1f; color: #fff; }
+      .beatbar-pill--toggle .beatbar-pill-dot {
+        width: 8px; height: 8px; border-radius: 50%;
+        background: #555; transition: background .15s, box-shadow .15s;
+      }
+      .beatbar-pill--toggle.on { color: #fff; background: #2f3a30; }
+      .beatbar-pill--toggle.on .beatbar-pill-dot {
+        background: #9ef0df; box-shadow: 0 0 6px rgba(158,240,223,0.6);
+      }
+      .beatbar-pill--toggle.on:hover { background: #3a4a3a; }
+      .beatbar-pill--range { padding: 4px 10px; gap: 6px; }
+      .beatbar-pill--range .beatbar-range-label { color: #9ca3af; }
+      .beatbar-pill--range input[type="range"] {
+        -webkit-appearance: none; appearance: none;
+        width: 70px; height: 4px;
+        background: #3A3A3A; border-radius: 2px;
+        outline: none; padding: 0; margin: 0;
+        cursor: pointer;
+      }
+      .beatbar-pill--range input[type="range"]::-webkit-slider-thumb {
+        -webkit-appearance: none; appearance: none;
+        width: 12px; height: 12px; border-radius: 50%;
+        background: #9ef0df; cursor: pointer; border: none;
+      }
+      .beatbar-pill--range input[type="range"]::-moz-range-thumb {
+        width: 12px; height: 12px; border-radius: 50%;
+        background: #9ef0df; cursor: pointer; border: none;
+      }
+      .beatbar-range-val {
+        color: #fff; font-variant-numeric: tabular-nums;
+        min-width: 28px; text-align: right;
+      }
+      .beatbar-pill--icon { padding: 4px 8px; font-size: 14px; }
+
+      /* Settings modal */
       .beatbar-modal {
         position: fixed; inset: 0; background: rgba(0,0,0,0.6);
         z-index: 2147483647; display: flex; align-items: center; justify-content: center;
@@ -1276,7 +1490,11 @@
         if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable)) return;
         e.preventDefault();
         pageEnabled = !pageEnabled;
+        config.enabled = pageEnabled;
+        saveConfig(config);
         log('Page enabled:', pageEnabled);
+        const toggle = document.querySelector('[data-bb="toggle"]');
+        if (toggle) toggle.classList.toggle('on', pageEnabled);
         if (pageEnabled) scanForVideos();
         else detachAll();
       }
@@ -1295,7 +1513,6 @@
     const mo = new MutationObserver(() => debouncedScan());
     mo.observe(document.documentElement, { childList: true, subtree: true });
 
-    // Re-scan on viewport resize — main video may grow/shrink
     window.addEventListener('resize', debouncedScan, { passive: true });
 
     let lastUrl = location.href;
@@ -1312,12 +1529,15 @@
     GM_registerMenuCommand('Beat Bar — Settings', openSettings);
     GM_registerMenuCommand('Beat Bar — Toggle on this page', () => {
       pageEnabled = !pageEnabled;
+      config.enabled = pageEnabled;
+      saveConfig(config);
+      const toggle = document.querySelector('[data-bb="toggle"]');
+      if (toggle) toggle.classList.toggle('on', pageEnabled);
       if (pageEnabled) scanForVideos();
       else detachAll();
     });
   }
 
-  // Sniffer is already running (document-start). UI/scan must wait for body.
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {
