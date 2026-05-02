@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Beat Bar
 // @namespace    https://github.com/Aericocode/userscripts
-// @version      2.4.0
+// @version      2.5.3
 // @description  Detect & visualize beats on direct-MP4 OR HLS-streaming videos. Sniffs m3u8 playlists, fetches lowest-quality variant, transmuxes TS→fMP4 audio, runs offline beat detection, overlays scrolling beat bar synced to playback.
 // @author       Aericocode
 // @match        https://pmvhaven.com/*
@@ -31,7 +31,7 @@
   const FALLBACK_QUALITY_ORDER = ['240p', '360p', '480p', '720p', '1080p'];
   const MIN_VIDEO_AREA = 556 * 312;
 
-  const SIZE_HEIGHTS = { small: 60, medium: 90, large: 130 };
+  const SIZE_HEIGHTS = { small: 60, medium: 90, large: 130, xl: 180 };
 
   const PRESETS = {
     kick: { bandLow: 40, bandHigh: 120, minBpm: 80, maxBpm: 180, sensitivity: 1.5, avgWindow: 1.0, q: 1.5 },
@@ -713,13 +713,20 @@
         overlay.style.display = 'none';
         return;
       }
-      const h = currentOverlayHeight();
+      const isFull = config.size === 'full';
+      // Full mode: spans most of the video height, vertically centered.
+      // Other sizes: fixed height anchored above native controls.
+      const h = isFull ? Math.max(120, rect.height * 0.7) : currentOverlayHeight();
+      const top = isFull
+        ? rect.top + (rect.height - h) / 2
+        : rect.bottom - h - PLAYBACK_BAR_OFFSET;
       overlay.style.display = config.showOverlay ? '' : 'none';
       overlay.style.left = `${rect.left}px`;
-      overlay.style.top = `${rect.bottom - h - PLAYBACK_BAR_OFFSET}px`;
+      overlay.style.top = `${top}px`;
       overlay.style.width = `${rect.width}px`;
       overlay.style.height = `${h}px`;
-      overlay.style.paddingBottom = `2rem`;
+      overlay.style.paddingBottom = isFull ? '0' : '2rem';
+      overlay.classList.toggle('beatbar-overlay--full', isFull);
       resizeCanvas(state);
     };
     state._updatePos = updatePos;
@@ -817,6 +824,8 @@
         <option value="small">S</option>
         <option value="medium">M</option>
         <option value="large">L</option>
+        <option value="xl">XL</option>
+        <option value="full">Full</option>
       </select>
       <div class="beatbar-pill beatbar-pill--range" title="Lookahead — how many seconds of upcoming beats to show">
         <span class="beatbar-range-label">Speed</span>
@@ -1022,6 +1031,15 @@
     noiseSrc.stop(now + 0.018);
   }
 
+  // ─────────────────────────────────────────────────────────────
+  // Visual tuning constants — adjust these to taste:
+  //   PAST_FADE_SEC: how many seconds after a beat passes the playhead
+  //                  before it fully fades out. Lower = snappier disappearance.
+  //   PULSE_LIFE_SEC: how long the expand+glow pulse lasts when a beat hits.
+  // ─────────────────────────────────────────────────────────────
+  const PAST_FADE_SEC = 1.2;
+  const PULSE_LIFE_SEC = 0.4;
+
   function drawBar(state, now) {
     const ctx = state.ctx;
     const canvas = state.canvas;
@@ -1032,30 +1050,34 @@
 
     ctx.clearRect(0, 0, w, h);
 
-    const pad = 4;
-    const radius = 8;
-    const cardX = pad, cardY = pad;
-    const cardW = w - pad * 2, cardH = h - pad * 2;
+    const isFull = config.size === 'full';
 
-    ctx.fillStyle = 'rgba(0,0,0,0.28)';
-    ctx.strokeStyle = 'rgba(255,255,255,0.14)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.roundRect(cardX, cardY, cardW, cardH, radius);
-    ctx.fill();
-    ctx.stroke();
+    // Background card — skipped in full mode for a clean overlay on the video.
+    if (!isFull) {
+      const pad = 4;
+      const radius = 8;
+      const cardX = pad, cardY = pad;
+      const cardW = w - pad * 2, cardH = h - pad * 2;
 
-    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(cardX + 8, h / 2);
-    ctx.lineTo(cardX + cardW - 8, h / 2);
-    ctx.stroke();
+      ctx.fillStyle = 'rgba(0,0,0,0.28)';
+      ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(cardX, cardY, cardW, cardH, radius);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(cardX + 8, h / 2);
+      ctx.lineTo(cardX + cardW - 8, h / 2);
+      ctx.stroke();
+    }
 
     if (!state.beats.length) return;
 
-    // beatOffsetMs shifts where beats sit on the bar. Subtracting from `t`
-    // is equivalent to adding the offset to every beat's effective time.
+    // beatOffsetMs shifts where beats sit on the bar.
     const offset = (config.beatOffsetMs || 0) / 1000;
     const t = state.smoothTime - offset;
     const lookahead = config.lookahead;
@@ -1063,12 +1085,29 @@
     const lookbehind = lookahead * (PLAYHEAD_X_FRAC / (1 - PLAYHEAD_X_FRAC));
     const pxPerSec = (w - playheadX) / lookahead;
 
-    ctx.strokeStyle = 'rgba(255,255,255,0.6)';
-    ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(playheadX, 6); ctx.lineTo(playheadX, h - 6); ctx.stroke();
-
-    const baseR = Math.max(7, Math.min(11, h * 0.1));
+    const baseR = isFull
+      ? Math.max(10, Math.min(20, h * 0.06))
+      : Math.max(7, Math.min(11, h * 0.1));
     const pulseR = baseR + 12;
+
+    // ───── Full-mode centerline + playhead ─────
+    // Both are constrained to "just bigger than the dots zone" — a horizontal
+    // strip ~baseR*1.6 tall — and rendered very faintly so the video reads through.
+    if (isFull) {
+      // Vertical playhead only — short tick centered on the dot strip.
+      // Horizontal centerline removed (it added noise without aiding timing).
+      const halfStripH = baseR * 1.4;
+      ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(playheadX, h / 2 - halfStripH);
+      ctx.lineTo(playheadX, h / 2 + halfStripH);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(playheadX, 6); ctx.lineTo(playheadX, h - 6); ctx.stroke();
+    }
 
     const firstT = t - lookbehind - 0.2;
     let lo = 0, hi = state.beats.length;
@@ -1076,6 +1115,12 @@
       const mid = (lo + hi) >> 1;
       if (state.beats[mid] < firstT) lo = mid + 1; else hi = mid;
     }
+
+    // ───── Dot transparency ─────
+    // Full mode uses hollow rings (lower visual weight than filled disks),
+    // so dotAlpha can be a bit higher without dominating the video.
+    const dotAlpha = isFull ? 0.75 : 1.0;
+    const glowMult = isFull ? 0.35 : 0.55;
 
     for (let i = lo; i < state.beats.length; i++) {
       const bt = state.beats[i];
@@ -1085,15 +1130,23 @@
       const x = playheadX + dt * pxPerSec;
       const y = h / 2;
 
+      // ───── Past-beat fade ──────────────────────────────────────
+      // dt < 0 means the beat has passed the playhead. Fade linearly
+      // from 1 → 0 over PAST_FADE_SEC. Skip drawing entirely once gone.
+      let fade = 1;
+      if (dt < 0) {
+        fade = 1 - Math.min(1, -dt / PAST_FADE_SEC);
+        if (fade <= 0) continue;
+      }
+
       const pulse = state.pulses.get(i);
       let radius = baseR;
       let glow = 0;
       if (pulse) {
         const age = (now - pulse.startTime) / 1000;
-        const LIFE = 0.4;
-        if (age > LIFE) state.pulses.delete(i);
+        if (age > PULSE_LIFE_SEC) state.pulses.delete(i);
         else {
-          const k = 1 - (age / LIFE);
+          const k = 1 - (age / PULSE_LIFE_SEC);
           radius = baseR + k * (pulseR - baseR);
           glow = k;
         }
@@ -1101,21 +1154,49 @@
 
       if (glow > 0) {
         const g = ctx.createRadialGradient(x, y, 0, x, y, radius + 18);
-        g.addColorStop(0, `rgba(122,168,255,${glow * 0.55})`);
+        g.addColorStop(0, `rgba(122,168,255,${glow * glowMult * fade})`);
         g.addColorStop(1, 'rgba(122,168,255,0)');
         ctx.fillStyle = g;
         ctx.beginPath(); ctx.arc(x, y, radius + 18, 0, Math.PI * 2); ctx.fill();
       }
 
       const isPast = dt < -0.02;
-      ctx.fillStyle = 'rgba(0,0,0,0.55)';
-      ctx.beginPath(); ctx.arc(x, y, radius + 1.5, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = isPast ? '#9ef0df' : '#7aa8ff';
-      ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
 
-      ctx.strokeStyle = isPast ? 'rgba(158,240,223,0.4)' : 'rgba(122,168,255,0.4)';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath(); ctx.moveTo(x, y + radius + 3); ctx.lineTo(x, h - 6); ctx.stroke();
+      // Apply fade via globalAlpha so all subsequent strokes/fills inherit it
+      ctx.save();
+      ctx.globalAlpha = fade * dotAlpha;
+
+      if (isFull) {
+        // Full mode: faint fill (so video reads through clearly) + crisp border.
+        // The fill alpha is set explicitly via globalAlpha so it's independent
+        // of dotAlpha — otherwise the two multiply and the fill disappears.
+        const dotColor = isPast ? '#9ef0df' : '#7aa8ff';
+
+        // Faint center fill — ~15% opacity regardless of dotAlpha
+        ctx.save();
+        ctx.globalAlpha = fade * 0.15;
+        ctx.fillStyle = dotColor;
+        ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+
+        // Solid border at full dot alpha
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = dotColor;
+        ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.stroke();
+      } else {
+        // Standard mode: dark halo for contrast, then solid filled dot.
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.beginPath(); ctx.arc(x, y, radius + 1.5, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = isPast ? '#9ef0df' : '#7aa8ff';
+        ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
+
+        // Drop line to bottom of bar — only in non-full modes
+        ctx.strokeStyle = isPast ? 'rgba(158,240,223,0.4)' : 'rgba(122,168,255,0.4)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(x, y + radius + 3); ctx.lineTo(x, h - 6); ctx.stroke();
+      }
+
+      ctx.restore();
     }
   }
 
@@ -1227,55 +1308,39 @@
               <option value="broad" ${cfg.preset==='broad'?'selected':''}>Broad</option>
             </select>
           </label>
-          <label class="beatbar-row">
-            <span>Bar size</span>
+          <label class="beatbar-row" title="Bar size. Full mode removes the background and centers vertically on the video.">
+            <span>Bar size <span class="beatbar-faint">ⓘ</span></span>
             <select data-key="size">
               <option value="small" ${cfg.size==='small'?'selected':''}>Small</option>
               <option value="medium" ${cfg.size==='medium'?'selected':''}>Medium</option>
               <option value="large" ${cfg.size==='large'?'selected':''}>Large</option>
-            </select>
-          </label>
-          <label class="beatbar-row">
-            <span>HLS quality (lowest = fastest)</span>
-            <select data-key="hlsQuality">
-              <option value="240p" ${cfg.hlsQuality==='240p'?'selected':''}>240p</option>
-              <option value="360p" ${cfg.hlsQuality==='360p'?'selected':''}>360p</option>
-              <option value="480p" ${cfg.hlsQuality==='480p'?'selected':''}>480p</option>
-              <option value="720p" ${cfg.hlsQuality==='720p'?'selected':''}>720p</option>
+              <option value="xl" ${cfg.size==='xl'?'selected':''}>XL</option>
+              <option value="full" ${cfg.size==='full'?'selected':''}>Full</option>
             </select>
           </label>
           <label class="beatbar-row">
             <span>Lookahead (sec)</span>
             <input type="number" data-key="lookahead" min="2.5" max="7.5" step="0.5" value="${cfg.lookahead}">
           </label>
-          <label class="beatbar-row">
-            <span>Sens (×) <span class="beatbar-faint" title="Detection sensitivity multiplier. Higher = more beats detected. Re-runs detection on save.">ⓘ</span></span>
+          <label class="beatbar-row" title="Detection sensitivity multiplier. Higher = more beats detected. Re-runs detection on save.">
+            <span>Sens (×) <span class="beatbar-faint">ⓘ</span></span>
             <input type="number" data-key="sensitivity" min="0.5" max="3" step="0.1" value="${cfg.sensitivity}">
           </label>
-          <label class="beatbar-row">
-            <span>Beat offset (ms) <span class="beatbar-faint" title="Shift detected beats by N ms. Positive = later, negative = earlier. Adjust if beat markers consistently miss the centerline.">ⓘ</span></span>
+          <label class="beatbar-row" title="Shift detected beats by N ms. Positive = later, negative = earlier. Adjust if beat markers consistently miss the centerline.">
+            <span>Beat offset (ms) <span class="beatbar-faint">ⓘ</span></span>
             <input type="number" data-key="beatOffsetMs" min="-500" max="500" step="5" value="${cfg.beatOffsetMs}">
           </label>
           <label class="beatbar-row">
             <span>Audio tick on beat</span>
             <input type="checkbox" data-key="tickEnabled" ${cfg.tickEnabled?'checked':''}>
           </label>
-          <label class="beatbar-row">
-            <span>Tick lead (ms) <span class="beatbar-faint" title="Visual lead — fire pulse & tick this many ms before the beat. Compensates for audio output latency. Independent of beat offset.">ⓘ</span></span>
+          <label class="beatbar-row" title="Visual lead — fire pulse & tick this many ms before the beat. Compensates for audio output latency. Independent of beat offset.">
+            <span>Tick lead (ms) <span class="beatbar-faint">ⓘ</span></span>
             <input type="number" data-key="tickLeadMs" min="0" max="200" step="5" value="${cfg.tickLeadMs}">
           </label>
           <label class="beatbar-row">
             <span>Show beat bar</span>
             <input type="checkbox" data-key="showOverlay" ${cfg.showOverlay?'checked':''}>
-          </label>
-          <hr>
-          <label class="beatbar-row">
-            <span>Main video only</span>
-            <input type="checkbox" data-key="onlyLargest" ${cfg.onlyLargest?'checked':''}>
-          </label>
-          <label class="beatbar-row">
-            <span>Min video area (px²)</span>
-            <input type="number" data-key="minVideoArea" min="1000" max="500000" step="1000" value="${cfg.minVideoArea}">
           </label>
           <hr>
           <div class="beatbar-faint" style="font-size:11px;line-height:1.5">
@@ -1302,15 +1367,12 @@
         const next = { ...cfg };
         next.preset = modal.querySelector('[data-key="preset"]').value;
         next.size = modal.querySelector('[data-key="size"]').value;
-        next.hlsQuality = modal.querySelector('[data-key="hlsQuality"]').value;
         next.lookahead = parseFloat(modal.querySelector('[data-key="lookahead"]').value);
         next.sensitivity = parseFloat(modal.querySelector('[data-key="sensitivity"]').value) || 1.0;
         next.beatOffsetMs = parseFloat(modal.querySelector('[data-key="beatOffsetMs"]').value) || 0;
         next.tickEnabled = modal.querySelector('[data-key="tickEnabled"]').checked;
         next.tickLeadMs = parseFloat(modal.querySelector('[data-key="tickLeadMs"]').value) || 0;
         next.showOverlay = modal.querySelector('[data-key="showOverlay"]').checked;
-        next.onlyLargest = modal.querySelector('[data-key="onlyLargest"]').checked;
-        next.minVideoArea = parseInt(modal.querySelector('[data-key="minVideoArea"]').value, 10) || MIN_VIDEO_AREA;
         // Detection-affecting fields — only re-analyze if these changed
         const detectionChanged = next.preset !== cfg.preset || next.sensitivity !== cfg.sensitivity;
         saveConfig(next);
